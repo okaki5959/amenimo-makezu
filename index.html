@@ -59,10 +59,59 @@
             letter-spacing: 3px;
             transition: opacity 1s;
         }
+        #ending-overlay {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #000;
+            z-index: 90;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 2s ease;
+        }
+        #ending-overlay.visible {
+            opacity: 1;
+            pointer-events: auto;
+        }
+        .ending-content {
+            text-align: center;
+            color: rgba(255, 255, 255, 0);
+            transition: color 2s ease 1s;
+        }
+        #ending-overlay.visible .ending-content {
+            color: rgba(255, 255, 255, 0.85);
+        }
+        .ending-title {
+            font-size: 2rem;
+            letter-spacing: 8px;
+            margin: 0 0 16px 0;
+            font-weight: normal;
+        }
+        .ending-author {
+            font-size: 1.1rem;
+            letter-spacing: 4px;
+            margin: 0 0 40px 0;
+            font-weight: normal;
+        }
+        .ending-credit {
+            font-size: 0.75rem;
+            letter-spacing: 2px;
+            margin: 0;
+            opacity: 0.5;
+        }
     </style>
 </head>
 <body>
     <div id="audio-start">クリックして始める</div>
+    <div id="ending-overlay">
+        <div class="ending-content">
+            <p class="ending-title">雨ニモマケズ</p>
+            <p class="ending-author">宮沢賢治</p>
+            <p class="ending-credit">Interactive Art by あまやどり出版</p>
+        </div>
+    </div>
     <div id="loading">言霊を紡いでいます...</div>
     <div id="ui-container">
         <h1 id="ui-title">雨ニモマケズ</h1>
@@ -107,6 +156,8 @@
         const TEXT_CENTER_TARGET = 0.0; // 画面中央のx座標
         const BELL_PLAY_COUNT = 3;
         const BELL_GAP_SEC = 1.5;
+        const MAX_CYCLES = 2;            // 2周で終了
+        const ENDING_DISPLAY_SEC = 7;    // テロップ表示時間（秒）
 
         const PARTICLE_TYPE = {
             GROUND: 0.0,
@@ -334,9 +385,12 @@
 
         let scene, camera, renderer, uniforms;
         let mouseX = 0, mouseY = 0;
-        let lastTime = 0, phaseTimer = 0, currentPhaseIndex = 0;
+        let lastTime = 0;
+        let currentPhaseIndex = 0;
+        let lastPhaseIndex = -1;       // フェーズ変更検知用
         let weatherPhaseX = 0, weatherPhaseY = 0;
         let isMainTextFadingOut = false;
+        let phaseStartTime = 0;        // 現フェーズの開始時刻（uTime秒）
 
         let groundParticles, fieldParticles, weatherParticles, giantTreeParticles, mainTextParticles;
 
@@ -350,15 +404,15 @@
         let targetParams = phases[0];
 
         // ========================================
-        // オーディオシステム（HTMLAudioElement方式）
+        // オーディオシステム（完全フレーム同期方式）
+        // setTimeout/setInterval を一切使わない
         // ========================================
 
-        // HTML埋め込み<audio>要素を取得
         const bgElements = [
             document.getElementById('bg0'),
             document.getElementById('bg1'),
             document.getElementById('bg2'),
-            null // phase 3 は背景音なし
+            null
         ];
         const voiceElements = [
             document.getElementById('voice0'),
@@ -368,104 +422,125 @@
         ];
         const bellElement = document.getElementById('bell');
 
-        let activeBgIndex = -1;
-        let bellTimeouts = [];
-        let voiceTimeout = null;
+        const bgTargetVol = [0, 0, 0];
+        const bgCurrentVol = [0, 0, 0];
+
         let audioReady = false;
+
+        // 声の状態（カウンター方式）
+        let voicePending = false;
+        let voiceCountdown = 0;       // 秒
+        let voicePhaseIndex = -1;
+
+        // 鈴の状態（カウンター方式）
+        let bellsRemaining = 0;
+        let bellCooldown = 0;          // 秒
 
         function initAudio() {
             audioReady = true;
+            // BG音を全て volume=0 で再生開始し、以後 pause しない
+            // Chrome は pause→play を繰り返すと内部状態が壊れるため
+            for (let i = 0; i < bgElements.length; i++) {
+                const bg = bgElements[i];
+                if (!bg) continue;
+                bg.volume = 0;
+                bgCurrentVol[i] = 0;
+                bgTargetVol[i] = 0;
+                bg.play().catch(() => {});
+            }
             startPhaseAudio(currentPhaseIndex);
         }
 
-        function fadeVolume(audio, toVol, durationMs, onDone) {
-            if (!audio) { if (onDone) onDone(); return; }
-            const fromVol = audio.volume;
-            const steps = Math.max(1, Math.floor(durationMs / 50));
-            const delta = (toVol - fromVol) / steps;
-            let count = 0;
-            const id = setInterval(() => {
-                count++;
-                audio.volume = Math.max(0, Math.min(1, fromVol + delta * count));
-                if (count >= steps) {
-                    clearInterval(id);
-                    audio.volume = Math.max(0, Math.min(1, toVol));
-                    if (toVol <= 0) { audio.pause(); audio.currentTime = 0; }
-                    if (onDone) onDone();
-                }
-            }, 50);
-        }
-
-        // テキストが画面中央に到達するまでの待ち時間(ms)を計算
-        function calcVoiceDelay() {
-            const now = uniforms.uTime.value; // 現在のuTime（秒）
-            // シェーダーと同じ式: blockX = 10.0 - mod(uTime * speed, totalWidth)
+        // テキストが画面中央に到達するまでの待ち時間（秒）を計算
+        function calcVoiceDelaySec() {
+            const now = uniforms.uTime.value;
             const scrollPos = (now * TEXT_SCROLL_SPEED) % TEXT_SCROLL_WIDTH;
             const currentX = TEXT_START_X - scrollPos;
-            // currentX → TEXT_CENTER_TARGET まで移動する時間を計算
             let distance = currentX - TEXT_CENTER_TARGET;
-            if (distance < 0) {
-                // 既に中央を通り過ぎている → 次の周回で中央に来るまで待つ
-                distance += TEXT_SCROLL_WIDTH;
-            }
-            return (distance / TEXT_SCROLL_SPEED) * 1000; // ms
+            if (distance < 0) distance += TEXT_SCROLL_WIDTH;
+            return distance / TEXT_SCROLL_SPEED;
         }
 
         function startPhaseAudio(phaseIndex) {
             if (!audioReady) return;
 
-            // 前の鈴・声スケジュールをクリア
-            bellTimeouts.forEach(t => clearTimeout(t));
-            bellTimeouts = [];
-            if (voiceTimeout) { clearTimeout(voiceTimeout); voiceTimeout = null; }
-
-            // --- 背景音のクロスフェード ---
-            // 前の背景音をフェードアウト
-            if (activeBgIndex >= 0 && bgElements[activeBgIndex]) {
-                fadeVolume(bgElements[activeBgIndex], 0, AUDIO_CROSSFADE_SEC * 1000);
+            // --- 背景音：pause せずボリュームだけで制御 ---
+            // 全BGのターゲットを0にし、対象だけBG_AUDIO_VOLUMEに設定
+            for (let i = 0; i < bgElements.length; i++) {
+                bgTargetVol[i] = 0;
+            }
+            if (bgElements[phaseIndex]) {
+                bgTargetVol[phaseIndex] = BG_AUDIO_VOLUME;
+                // 再生中でなければ再開（初回 or タブ復帰時のみ）
+                if (bgElements[phaseIndex].paused) {
+                    bgElements[phaseIndex].volume = 0;
+                    bgElements[phaseIndex].play().catch(() => {});
+                }
             }
 
-            // 新しい背景音をフェードイン
-            activeBgIndex = phaseIndex;
-            const newBg = bgElements[phaseIndex];
-            if (newBg) {
-                newBg.currentTime = 0;
-                newBg.volume = BG_AUDIO_VOLUME;
-                newBg.play();
-            }
-
-            // --- 声データの再生 ---
-            // 全声を停止
+            // --- 声：前の声を止めて、カウンダウン開始 ---
             voiceElements.forEach(v => { if (v) { v.pause(); v.currentTime = 0; } });
+            voicePending = false;
 
-            const voice = voiceElements[phaseIndex];
-            if (voice) {
-                voice.volume = VOICE_VOLUME;
-                // テキストが画面中央に来る瞬間を計算して、そこで声を出す
-                const delay = calcVoiceDelay();
-                voiceTimeout = setTimeout(() => {
-                    voice.currentTime = 0;
-                    voice.play();
-                }, delay);
+            if (voiceElements[phaseIndex]) {
+                voicePending = true;
+                voiceCountdown = calcVoiceDelaySec();
+                voicePhaseIndex = phaseIndex;
             }
 
-            // 大木フェーズ（phase 3）なら鈴を3回鳴らす
-            if (phaseIndex === 3) {
-                scheduleBells();
-            }
+            // --- 鈴：カウンター設定 ---
+            bellsRemaining = (phaseIndex === 3) ? BELL_PLAY_COUNT : 0;
+            bellCooldown = 1.5;
         }
 
-        function scheduleBells() {
-            const dur = bellElement.duration || 2;
-            const interval = dur + BELL_GAP_SEC;
-            for (let i = 0; i < BELL_PLAY_COUNT; i++) {
-                const delay = i * interval * 1000 + 1500;
-                const t = setTimeout(() => {
+        // animateループから毎フレーム呼ばれる
+        function updateAudio(deltaTime) {
+            if (!audioReady) return;
+
+            // --- 背景音フェード ---
+            const fadeSpeed = 1.0 / AUDIO_CROSSFADE_SEC;
+            for (let i = 0; i < bgElements.length; i++) {
+                const bg = bgElements[i];
+                if (!bg) continue;
+
+                const diff = bgTargetVol[i] - bgCurrentVol[i];
+                if (Math.abs(diff) < 0.005) {
+                    bgCurrentVol[i] = bgTargetVol[i];
+                } else {
+                    const change = fadeSpeed * deltaTime;
+                    if (diff > 0) bgCurrentVol[i] = Math.min(bgTargetVol[i], bgCurrentVol[i] + change);
+                    else bgCurrentVol[i] = Math.max(bgTargetVol[i], bgCurrentVol[i] - change);
+                }
+
+                bg.volume = Math.max(0, Math.min(1, bgCurrentVol[i]));
+                // pause しない — volume=0 のまま再生し続ける
+                // Chrome の pause→play 繰り返しバグを回避
+            }
+
+            // --- 声カウントダウン ---
+            if (voicePending) {
+                voiceCountdown -= deltaTime;
+                if (voiceCountdown <= 0) {
+                    voicePending = false;
+                    const voice = voiceElements[voicePhaseIndex];
+                    if (voice) {
+                        voice.currentTime = 0;
+                        voice.volume = VOICE_VOLUME;
+                        voice.play();
+                    }
+                }
+            }
+
+            // --- 鈴カウントダウン ---
+            if (bellsRemaining > 0) {
+                bellCooldown -= deltaTime;
+                if (bellCooldown <= 0) {
                     bellElement.currentTime = 0;
                     bellElement.volume = 0.8;
                     bellElement.play();
-                }, delay);
-                bellTimeouts.push(t);
+                    bellsRemaining--;
+                    bellCooldown = (bellElement.duration || 2) + BELL_GAP_SEC;
+                }
             }
         }
 
@@ -703,27 +778,28 @@
         // フェーズ遷移
         // ========================================
 
-        function transitionToNextPhase() {
-            const ui = document.getElementById('ui-container');
-            ui.style.opacity = 0;
+        // フェーズ変更時に呼ばれる（音声＋映像の切り替え開始）
+        function onPhaseChanged(newIndex) {
+            // 音声クロスフェード即開始
+            startPhaseAudio(newIndex);
+
+            // 映像フェードアウト開始
+            document.getElementById('ui-container').style.opacity = 0;
             isMainTextFadingOut = true;
+        }
 
-            // 音声のクロスフェードはすぐ開始（視覚より先に音が混ざり始める）
-            const nextIndex = (currentPhaseIndex + 1) % phases.length;
-            startPhaseAudio(nextIndex);
+        // フェーズ変更後の映像切り替え完了（1秒後に呼ばれる）
+        function onPhaseVisualReady(newIndex) {
+            currentPhaseIndex = newIndex;
+            targetParams = phases[newIndex];
 
-            setTimeout(() => {
-                currentPhaseIndex = nextIndex;
-                targetParams = phases[currentPhaseIndex];
+            document.getElementById('ui-title').innerText = targetParams.title;
+            document.getElementById('ui-desc').innerText = targetParams.desc;
+            document.getElementById('ui-container').style.opacity = 1;
 
-                document.getElementById('ui-title').innerText = targetParams.title;
-                document.getElementById('ui-desc').innerText = targetParams.desc;
-                ui.style.opacity = 1;
-
-                updateMainText(currentPhaseIndex);
-                updateBackgroundChars(currentPhaseIndex);
-                isMainTextFadingOut = false;
-            }, PHASE_TRANSITION_MS);
+            updateMainText(newIndex);
+            updateBackgroundChars(newIndex);
+            isMainTextFadingOut = false;
         }
 
         function interpolateParams(deltaTime) {
@@ -752,6 +828,90 @@
         // アニメーションループ
         // ========================================
 
+        // フェーズをuTimeから直接計算（蓄積なし・ズレ不可能）
+        const TOTAL_CYCLE_SEC = PHASE_DURATION * phases.length;
+        const TOTAL_SHOW_SEC = TOTAL_CYCLE_SEC * MAX_CYCLES; // 2周分の合計秒数
+        const TRANSITION_SEC = PHASE_TRANSITION_MS / 1000;
+        let visualPhaseReady = false;
+
+        // 公演管理
+        let showStartTime = -1;       // 開始時刻（秒） -1 = まだ開始していない
+        let showEnded = false;         // エンディング表示中
+        let showFullyStopped = false;  // 初期画面に戻った
+
+        function stopAllAudio() {
+            for (let i = 0; i < bgElements.length; i++) {
+                if (!bgElements[i]) continue;
+                bgElements[i].pause();
+                bgElements[i].currentTime = 0;
+                bgCurrentVol[i] = 0;
+                bgTargetVol[i] = 0;
+            }
+            voiceElements.forEach(v => { if (v) { v.pause(); v.currentTime = 0; } });
+            voicePending = false;
+            bellsRemaining = 0;
+            if (bellElement) { bellElement.pause(); bellElement.currentTime = 0; }
+        }
+
+        function showEnding() {
+            showEnded = true;
+            stopAllAudio();
+
+            // シーンをフェードアウト（UIも消す）
+            document.getElementById('ui-container').style.opacity = 0;
+
+            // エンディングオーバーレイ表示
+            const ending = document.getElementById('ending-overlay');
+            ending.classList.add('visible');
+
+            // 一定時間後に初期画面に戻る
+            setTimeout(() => {
+                resetToStart();
+            }, ENDING_DISPLAY_SEC * 1000);
+        }
+
+        function resetToStart() {
+            // エンディングを非表示
+            const ending = document.getElementById('ending-overlay');
+            ending.classList.remove('visible');
+
+            // テロップが消えるのを待ってから初期画面を表示
+            setTimeout(() => {
+                showFullyStopped = true;
+                showEnded = false;
+                audioReady = false;
+
+                // 状態をリセット
+                showStartTime = -1;
+                lastPhaseIndex = -1;
+                currentPhaseIndex = 0;
+                visualPhaseReady = false;
+                isMainTextFadingOut = false;
+                targetParams = phases[0];
+                Object.assign(currentParams, {
+                    rain: 1.0, wind: 0.05, snow: 0.0,
+                    sceneAlpha: 0.8, treeAlpha: 0.0
+                });
+                currentParams.bgColor.set(0x010306);
+                currentParams.groundColor.set(0.35, 0.25, 0.15);
+                currentParams.cropsColor.set(0.30, 0.45, 0.30);
+
+                // テキストとUIをリセット
+                updateMainText(0);
+                updateBackgroundChars(0);
+                document.getElementById('ui-title').innerText = phases[0].title;
+                document.getElementById('ui-desc').innerText = phases[0].desc;
+                document.getElementById('ui-container').style.opacity = 1;
+
+                // 開始オーバーレイを再表示
+                const overlay = document.getElementById('audio-start');
+                if (overlay) {
+                    overlay.style.opacity = '1';
+                    overlay.style.pointerEvents = 'auto';
+                }
+            }, 2000);
+        }
+
         function animate(time) {
             requestAnimationFrame(animate);
 
@@ -760,13 +920,55 @@
             lastTime = time;
 
             const timeSec = time * 0.001;
-            uniforms.uTime.value = timeSec;
 
-            // フェーズ遷移
-            phaseTimer += deltaTime;
-            if (phaseTimer > PHASE_DURATION) {
-                phaseTimer = 0;
-                transitionToNextPhase();
+            // 公演がまだ開始していない or 完全停止中はレンダリングのみ
+            if (showStartTime < 0 || showFullyStopped) {
+                uniforms.uTime.value = 0;
+                syncUniforms();
+                renderer.render(scene, camera);
+                return;
+            }
+
+            // 公演開始からの経過時間（シェーダーもこれを使う）
+            const elapsed = timeSec - showStartTime;
+            uniforms.uTime.value = elapsed;
+
+            // --- 2周完了チェック ---
+            if (!showEnded && elapsed >= TOTAL_SHOW_SEC) {
+                showEnding();
+            }
+
+            // エンディング表示中はシーン全体をフェードアウト
+            if (showEnded) {
+                currentParams.sceneAlpha = Math.max(0, currentParams.sceneAlpha - deltaTime * 0.5);
+                currentParams.treeAlpha = Math.max(0, currentParams.treeAlpha - deltaTime * 0.5);
+                // メインテキストも消す
+                const textAlphaU = mainTextParticles.material.uniforms.uAlpha;
+                textAlphaU.value = Math.max(0, textAlphaU.value - deltaTime * 1.5);
+                syncUniforms();
+                renderer.render(scene, camera);
+                return;
+            }
+
+            // --- フェーズをelapsedから直接算出（蓄積ゼロ） ---
+            const cycleTime = elapsed % TOTAL_CYCLE_SEC;
+            const derivedPhase = Math.floor(cycleTime / PHASE_DURATION);
+            const timeInPhase = cycleTime - derivedPhase * PHASE_DURATION;
+
+            // フェーズが変わった瞬間を検知
+            if (derivedPhase !== lastPhaseIndex) {
+                lastPhaseIndex = derivedPhase;
+                phaseStartTime = timeSec;
+                visualPhaseReady = false;
+
+                // 音声クロスフェード＋映像フェードアウト開始
+                onPhaseChanged(derivedPhase);
+            }
+
+            // 映像の切り替え完了（フェーズ開始からTRANSITION_SEC秒後）
+            if (!visualPhaseReady && timeInPhase >= TRANSITION_SEC) {
+                visualPhaseReady = true;
+                onPhaseVisualReady(derivedPhase);
             }
 
             // メインテキストのフェード
@@ -778,6 +980,9 @@
             interpolateParams(deltaTime);
             syncUniforms();
 
+            // オーディオ更新（背景音フェード・声・鈴すべて）
+            updateAudio(deltaTime);
+
             // 天候パーティクルの移動
             const { rain, wind, snow } = currentParams;
             weatherPhaseX += -(0.5 + wind * 20.0 + rain * 2.0 + snow * 5.0) * deltaTime;
@@ -785,7 +990,7 @@
             uniforms.uWeatherPhase.value.set(weatherPhaseX, weatherPhaseY);
 
             // カメラの軌道運動
-            const angle = timeSec * CAMERA_ORBIT_SPEED + mouseX * 0.5;
+            const angle = elapsed * CAMERA_ORBIT_SPEED + mouseX * 0.5;
             const targetX = CAMERA_ORBIT_RADIUS * Math.cos(angle);
             const targetZ = CAMERA_ORBIT_RADIUS * Math.sin(angle);
             const targetY = 3 - mouseY * 4;
@@ -846,13 +1051,21 @@
             }, 500);
         }
 
-        // クリックで音声を初期化（ブラウザの自動再生ポリシー対応）
+        // クリックで音声を初期化＆公演開始（ブラウザの自動再生ポリシー対応）
         function onStartClick() {
             const overlay = document.getElementById('audio-start');
             if (!overlay) return;
             overlay.style.opacity = '0';
             overlay.style.pointerEvents = 'none';
-            setTimeout(() => overlay.remove(), 1000);
+
+            // 公演状態リセット
+            showEnded = false;
+            showFullyStopped = false;
+
+            // 開始時刻を記録（次フレームのelapsedが0から始まる）
+            showStartTime = performance.now() * 0.001;
+            lastPhaseIndex = -1;
+
             initAudio();
         }
         document.getElementById('audio-start').addEventListener('click', onStartClick);
