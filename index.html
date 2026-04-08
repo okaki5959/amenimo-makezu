@@ -1,0 +1,868 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>雨ニモマケズ - Text Particles</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #02050a;
+            font-family: "Noto Serif JP", "Yu Mincho", "MS Mincho", serif;
+        }
+        canvas {
+            display: block;
+        }
+        #ui-container {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            color: rgba(255, 255, 255, 0.8);
+            pointer-events: none;
+            text-shadow: 0 2px 6px rgba(0,0,0,0.9);
+            transition: opacity 1s ease;
+        }
+        h1 {
+            font-size: 1.2rem;
+            margin: 0 0 5px 0;
+            font-weight: normal;
+            letter-spacing: 2px;
+        }
+        p {
+            font-size: 0.8rem;
+            margin: 0;
+            letter-spacing: 1px;
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #fff;
+            font-size: 1.2rem;
+            pointer-events: none;
+            transition: opacity 1s;
+            letter-spacing: 4px;
+        }
+        #audio-start {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.7);
+            color: rgba(255, 255, 255, 0.9);
+            font-size: 1.2rem;
+            cursor: pointer;
+            z-index: 100;
+            letter-spacing: 3px;
+            transition: opacity 1s;
+        }
+    </style>
+</head>
+<body>
+    <div id="audio-start">クリックして始める</div>
+    <div id="loading">言霊を紡いでいます...</div>
+    <div id="ui-container">
+        <h1 id="ui-title">雨ニモマケズ</h1>
+        <p id="ui-desc">雨粒が文字となって降り注ぎ、大地を濡らす</p>
+    </div>
+
+    <!-- 音声素材（HTMLに直接埋め込み） -->
+    <audio id="bg0" src="bg-rain.mp3" preload="auto" loop></audio>
+    <audio id="bg1" src="bg-wind.mp3" preload="auto" loop></audio>
+    <audio id="bg2" src="bg-snow.mp3" preload="auto" loop></audio>
+    <audio id="voice0" src="voice-rain.mp3" preload="auto"></audio>
+    <audio id="voice1" src="voice-wind.mp3" preload="auto"></audio>
+    <audio id="voice2" src="voice-snow.mp3" preload="auto"></audio>
+    <audio id="voice3" src="voice-tree.mp3" preload="auto"></audio>
+    <audio id="bell" src="bell.mp3" preload="auto"></audio>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+        // ========================================
+        // 定数
+        // ========================================
+
+        const PHASE_DURATION = 10;
+        const PHASE_TRANSITION_MS = 1000;
+        const MAX_TEXT_LENGTH = 15;
+        const LERP_SPEED = 1.5;
+        const BG_LERP_SPEED = 1.0;
+        const CAMERA_ORBIT_RADIUS = 22;
+        const CAMERA_ORBIT_SPEED = 0.05;
+        const CAMERA_EASE = 0.05;
+        const FOG_DENSITY = 0.025;
+        const SPACE_CHAR_INDEX = 31;
+        const TEXT_FADE_SPEED = 1.5;
+
+        const AUDIO_CROSSFADE_SEC = 2.0;
+        const BG_AUDIO_VOLUME = 0.25;
+        const VOICE_VOLUME = 1.0;
+        // テキストスクロールの定数（シェーダーと一致させる）
+        const TEXT_SCROLL_SPEED = 2.5;
+        const TEXT_SCROLL_WIDTH = 26.0;
+        const TEXT_START_X = 10.0;
+        const TEXT_CENTER_TARGET = 0.0; // 画面中央のx座標
+        const BELL_PLAY_COUNT = 3;
+        const BELL_GAP_SEC = 1.5;
+
+        const PARTICLE_TYPE = {
+            GROUND: 0.0,
+            FIELD: 1.0,
+            WEATHER: 2.0,
+            MAIN_TEXT: 4.0,
+            GIANT_TREE: 5.0
+        };
+
+        const CHARS_LIST = [
+            '雨','ニ','モ','マ','ケ','ズ','風','雪',
+            '夏','ノ','暑','サ','ヌ','ウ','イ','フ',
+            'ワ','タ','シ','ハ','ナ','リ','ッ','テ',
+            '土','畑','緑','白','静','大','地',' '
+        ];
+
+        const INTERPOLATED_KEYS = ['rain', 'wind', 'snow', 'sceneAlpha', 'treeAlpha'];
+        const LERP_COLOR_KEYS = ['bgColor', 'groundColor', 'cropsColor'];
+
+        // ========================================
+        // フェーズ定義
+        // ========================================
+
+        const phases = [
+            {
+                title: "雨ニモマケズ",
+                desc: "雨粒が文字となって降り注ぎ、大地を濡らす",
+                text: "雨ニモマケズ",
+                rain: 1.0, wind: 0.05, snow: 0.0,
+                bgColor: new THREE.Color(0x010306),
+                groundColor: new THREE.Color(0.35, 0.25, 0.15),
+                cropsColor: new THREE.Color(0.30, 0.45, 0.30),
+                sceneAlpha: 0.8, treeAlpha: 0.0
+            },
+            {
+                title: "風ニモマケズ",
+                desc: "強風が吹き荒れ、見渡す限りの緑が波打つ",
+                text: "風ニモマケズ",
+                rain: 0.1, wind: 1.0, snow: 0.0,
+                bgColor: new THREE.Color(0x030605),
+                groundColor: new THREE.Color(0.20, 0.40, 0.20),
+                cropsColor: new THREE.Color(0.40, 0.80, 0.40),
+                sceneAlpha: 0.8, treeAlpha: 0.0
+            },
+            {
+                title: "雪ニモ夏ノ暑サニモマケヌ",
+                desc: "白銀の世界。雪が静かに舞い落ちる",
+                text: "雪ニモ夏ノ暑サニモマケヌ",
+                rain: 0.0, wind: 0.2, snow: 1.0,
+                bgColor: new THREE.Color(0x0a0c10),
+                groundColor: new THREE.Color(0.90, 0.90, 0.95),
+                cropsColor: new THREE.Color(0.80, 0.85, 0.90),
+                sceneAlpha: 0.8, treeAlpha: 0.0
+            },
+            {
+                title: "サウイフモノニワタシハナリタイ",
+                desc: "静寂の中、光り輝く巨木が立つ",
+                text: "サウイフモノニワタシハナリタイ",
+                rain: 0.0, wind: 0.0, snow: 0.0,
+                bgColor: new THREE.Color(0x010204),
+                groundColor: new THREE.Color(0.1, 0.15, 0.2),
+                cropsColor: new THREE.Color(0.1, 0.15, 0.2),
+                sceneAlpha: 0.15,
+                treeAlpha: 1.0
+            }
+        ];
+
+        // ========================================
+        // シェーダー
+        // ========================================
+
+        const vertexShader = `
+            uniform float uTime;
+            uniform float uSize;
+            uniform float uType;
+            uniform vec2 uResolution;
+            uniform float uRain;
+            uniform float uWind;
+            uniform float uSnow;
+            uniform vec2 uWeatherPhase;
+
+            attribute float aCharIndex;
+            attribute vec3 aOffset;
+
+            varying float vCharIndex;
+            varying vec3 vPos;
+
+            void main() {
+                vCharIndex = aCharIndex;
+                vPos = position;
+                vec3 pos = position;
+
+                if (uType == 0.0) {
+                    // 地面：波と雨による揺れ
+                    float wave = sin(pos.x * 0.3 + uTime * (0.8 + uWind)) * 0.2
+                               + cos(pos.z * 0.3 + uTime * (0.6 + uWind)) * 0.2;
+                    pos.y += wave;
+                    pos.y += sin(pos.x * 5.0 + pos.z * 5.0 + uTime * 10.0) * 0.05 * uRain;
+
+                } else if (uType == 1.0) {
+                    // 作物：風と雪による傾き・揺れ
+                    float height = pos.y + 2.5;
+                    float sway = smoothstep(0.0, 1.5, height);
+                    float bend = (uWind * 2.5 + uSnow * 0.5) * sway;
+                    pos.x -= bend;
+                    pos.y -= bend * 0.3;
+                    float windSpeed = 1.0 + uWind * 4.0;
+                    pos.x += sin(uTime * windSpeed * 2.0 + pos.z * 0.5 + aOffset.x * 2.0) * (0.2 + uWind * 0.5) * sway;
+                    pos.y += sin(uTime * 4.0 + aOffset.y) * 0.1 * (1.0 + uRain * 2.0) * sway;
+
+                } else if (uType == 2.0) {
+                    // 天候パーティクル：ループ空間内で漂う
+                    vec3 wPos = pos;
+                    float snowSway = sin(uTime * 1.5 + aOffset.y * 10.0) * uSnow * 2.0;
+                    wPos.x += uWeatherPhase.x * (0.8 + aOffset.x * 0.4) + snowSway;
+                    wPos.y += uWeatherPhase.y * (0.8 + aOffset.y * 0.4);
+                    wPos.x = mod(wPos.x + 30.0, 60.0) - 30.0;
+                    wPos.y = mod(wPos.y + 10.0, 30.0) - 10.0;
+                    wPos.z = mod(wPos.z + 20.0, 40.0) - 20.0;
+                    wPos.x += sin(uTime * (1.0 + uWind * 5.0) + aOffset.x * 10.0) * (0.5 + uWind * 1.0);
+                    wPos.z += cos(uTime * (1.0 + uWind * 3.0) + aOffset.z * 10.0) * (0.5 + uWind * 1.0);
+                    pos = wPos;
+
+                } else if (uType == 4.0) {
+                    // メインテキスト：横スクロール
+                    float speed = 2.5;
+                    float totalWidth = 26.0;
+                    float blockX = 10.0 - mod(uTime * speed, totalWidth);
+                    pos.x = blockX + aOffset.x;
+                    pos.y += sin(uTime * 3.0 + aOffset.x * 2.0) * 0.05;
+
+                } else if (uType == 5.0) {
+                    // 光り輝く巨木：生命の鼓動のような揺らぎ
+                    float sway = smoothstep(-2.5, 15.0, pos.y);
+                    pos.x += sin(uTime * 1.5 + pos.y * 0.5 + aOffset.x) * 0.2 * sway;
+                    pos.z += cos(uTime * 1.2 + pos.y * 0.5 + aOffset.z) * 0.2 * sway;
+                    pos.y += sin(uTime * 2.0 + aOffset.x) * 0.1 * sway;
+                }
+
+                vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+                gl_PointSize = uSize * (uResolution.y / 800.0) * (25.0 / -mvPosition.z);
+                gl_Position = projectionMatrix * mvPosition;
+            }
+        `;
+
+        const fragmentShader = `
+            uniform sampler2D uTexture;
+            uniform float uAlpha;
+            uniform float uType;
+            uniform float uRain;
+            uniform float uWind;
+            uniform float uSnow;
+            uniform vec3 uGroundColor;
+            uniform vec3 uCropsColor;
+            uniform float uSceneAlpha;
+            uniform float uTreeAlpha;
+            uniform float uTime;
+
+            varying float vCharIndex;
+            varying vec3 vPos;
+
+            void main() {
+                float cols = 8.0;
+                float rows = 4.0;
+
+                float col = mod(floor(vCharIndex), cols);
+                float row = floor(floor(vCharIndex) / cols);
+
+                vec2 uv = vec2(gl_PointCoord.x, 1.0 - gl_PointCoord.y);
+                uv.x = (uv.x + col) / cols;
+                uv.y = (uv.y + (rows - 1.0 - row)) / rows;
+
+                float textAlpha = texture2D(uTexture, uv).r;
+                if (textAlpha < 0.3) discard;
+
+                // メインテキスト
+                if (uType == 4.0) {
+                    vec3 finalColor = vec3(0.95, 0.98, 1.0);
+                    float alpha = smoothstep(0.1, 0.4, textAlpha) * uAlpha;
+                    gl_FragColor = vec4(finalColor, alpha);
+                    return;
+                }
+
+                // 光り輝く巨木
+                if (uType == 5.0) {
+                    vec3 trunkColor = vec3(0.8, 0.5, 0.1);
+                    vec3 leafColor  = vec3(1.0, 0.9, 0.4);
+                    float h = smoothstep(0.0, 10.0, vPos.y);
+                    vec3 baseColor = mix(trunkColor, leafColor, h);
+                    vec3 finalColor = baseColor + vec3(mod(vCharIndex, 3.0) * 0.1);
+                    float twinkle = 0.8 + 0.2 * sin(uTime * 3.0 + vCharIndex * 10.0);
+                    float alpha = smoothstep(0.3, 0.7, textAlpha) * uTreeAlpha * twinkle;
+                    if (alpha <= 0.0) discard;
+                    gl_FragColor = vec4(finalColor, alpha);
+                    return;
+                }
+
+                // 地面・作物・天候
+                float sceneAlpha = smoothstep(0.3, 0.7, textAlpha) * uSceneAlpha;
+                if (sceneAlpha <= 0.0) discard;
+
+                vec3 baseColor = vec3(1.0);
+                if (uType == 0.0) baseColor = uGroundColor;
+                else if (uType == 1.0) baseColor = uCropsColor;
+
+                vec3 finalColor = baseColor + vec3(mod(vCharIndex, 3.0) * 0.1);
+
+                if (uType == 2.0) {
+                    vec3 rainColor = vec3(0.5, 0.7, 0.9);
+                    vec3 windColor = vec3(0.8, 0.9, 0.8);
+                    vec3 snowColor = vec3(1.0, 1.0, 1.0);
+                    float totalWeather = uRain + uWind + uSnow;
+                    finalColor = (totalWeather > 0.0)
+                        ? (rainColor * uRain + windColor * uWind + snowColor * uSnow) / totalWeather
+                        : vec3(1.0);
+                }
+
+                gl_FragColor = vec4(finalColor, sceneAlpha);
+            }
+        `;
+
+        // ========================================
+        // グローバル状態
+        // ========================================
+
+        let scene, camera, renderer, uniforms;
+        let mouseX = 0, mouseY = 0;
+        let lastTime = 0, phaseTimer = 0, currentPhaseIndex = 0;
+        let weatherPhaseX = 0, weatherPhaseY = 0;
+        let isMainTextFadingOut = false;
+
+        let groundParticles, fieldParticles, weatherParticles, giantTreeParticles, mainTextParticles;
+
+        let currentParams = {
+            rain: 1.0, wind: 0.05, snow: 0.0,
+            bgColor: new THREE.Color(0x010306),
+            groundColor: new THREE.Color(0.35, 0.25, 0.15),
+            cropsColor: new THREE.Color(0.30, 0.45, 0.30),
+            sceneAlpha: 0.8, treeAlpha: 0.0
+        };
+        let targetParams = phases[0];
+
+        // ========================================
+        // オーディオシステム（HTMLAudioElement方式）
+        // ========================================
+
+        // HTML埋め込み<audio>要素を取得
+        const bgElements = [
+            document.getElementById('bg0'),
+            document.getElementById('bg1'),
+            document.getElementById('bg2'),
+            null // phase 3 は背景音なし
+        ];
+        const voiceElements = [
+            document.getElementById('voice0'),
+            document.getElementById('voice1'),
+            document.getElementById('voice2'),
+            document.getElementById('voice3')
+        ];
+        const bellElement = document.getElementById('bell');
+
+        let activeBgIndex = -1;
+        let bellTimeouts = [];
+        let voiceTimeout = null;
+        let audioReady = false;
+
+        function initAudio() {
+            audioReady = true;
+            startPhaseAudio(currentPhaseIndex);
+        }
+
+        function fadeVolume(audio, toVol, durationMs, onDone) {
+            if (!audio) { if (onDone) onDone(); return; }
+            const fromVol = audio.volume;
+            const steps = Math.max(1, Math.floor(durationMs / 50));
+            const delta = (toVol - fromVol) / steps;
+            let count = 0;
+            const id = setInterval(() => {
+                count++;
+                audio.volume = Math.max(0, Math.min(1, fromVol + delta * count));
+                if (count >= steps) {
+                    clearInterval(id);
+                    audio.volume = Math.max(0, Math.min(1, toVol));
+                    if (toVol <= 0) { audio.pause(); audio.currentTime = 0; }
+                    if (onDone) onDone();
+                }
+            }, 50);
+        }
+
+        // テキストが画面中央に到達するまでの待ち時間(ms)を計算
+        function calcVoiceDelay() {
+            const now = uniforms.uTime.value; // 現在のuTime（秒）
+            // シェーダーと同じ式: blockX = 10.0 - mod(uTime * speed, totalWidth)
+            const scrollPos = (now * TEXT_SCROLL_SPEED) % TEXT_SCROLL_WIDTH;
+            const currentX = TEXT_START_X - scrollPos;
+            // currentX → TEXT_CENTER_TARGET まで移動する時間を計算
+            let distance = currentX - TEXT_CENTER_TARGET;
+            if (distance < 0) {
+                // 既に中央を通り過ぎている → 次の周回で中央に来るまで待つ
+                distance += TEXT_SCROLL_WIDTH;
+            }
+            return (distance / TEXT_SCROLL_SPEED) * 1000; // ms
+        }
+
+        function startPhaseAudio(phaseIndex) {
+            if (!audioReady) return;
+
+            // 前の鈴・声スケジュールをクリア
+            bellTimeouts.forEach(t => clearTimeout(t));
+            bellTimeouts = [];
+            if (voiceTimeout) { clearTimeout(voiceTimeout); voiceTimeout = null; }
+
+            // --- 背景音のクロスフェード ---
+            // 前の背景音をフェードアウト
+            if (activeBgIndex >= 0 && bgElements[activeBgIndex]) {
+                fadeVolume(bgElements[activeBgIndex], 0, AUDIO_CROSSFADE_SEC * 1000);
+            }
+
+            // 新しい背景音をフェードイン
+            activeBgIndex = phaseIndex;
+            const newBg = bgElements[phaseIndex];
+            if (newBg) {
+                newBg.currentTime = 0;
+                newBg.volume = BG_AUDIO_VOLUME;
+                newBg.play();
+            }
+
+            // --- 声データの再生 ---
+            // 全声を停止
+            voiceElements.forEach(v => { if (v) { v.pause(); v.currentTime = 0; } });
+
+            const voice = voiceElements[phaseIndex];
+            if (voice) {
+                voice.volume = VOICE_VOLUME;
+                // テキストが画面中央に来る瞬間を計算して、そこで声を出す
+                const delay = calcVoiceDelay();
+                voiceTimeout = setTimeout(() => {
+                    voice.currentTime = 0;
+                    voice.play();
+                }, delay);
+            }
+
+            // 大木フェーズ（phase 3）なら鈴を3回鳴らす
+            if (phaseIndex === 3) {
+                scheduleBells();
+            }
+        }
+
+        function scheduleBells() {
+            const dur = bellElement.duration || 2;
+            const interval = dur + BELL_GAP_SEC;
+            for (let i = 0; i < BELL_PLAY_COUNT; i++) {
+                const delay = i * interval * 1000 + 1500;
+                const t = setTimeout(() => {
+                    bellElement.currentTime = 0;
+                    bellElement.volume = 0.8;
+                    bellElement.play();
+                }, delay);
+                bellTimeouts.push(t);
+            }
+        }
+
+        // ========================================
+        // パーティクル生成ユーティリティ
+        // ========================================
+
+        function createParticleGeometry(count, positionGenerator) {
+            const positions = new Float32Array(count * 3);
+            const charIndices = new Float32Array(count);
+            const offsets = new Float32Array(count * 3);
+
+            for (let i = 0; i < count; i++) {
+                const pos = positionGenerator(i, count);
+                positions[i * 3]     = pos[0];
+                positions[i * 3 + 1] = pos[1];
+                positions[i * 3 + 2] = pos[2];
+                charIndices[i] = SPACE_CHAR_INDEX;
+                offsets[i * 3]     = Math.random();
+                offsets[i * 3 + 1] = Math.random();
+                offsets[i * 3 + 2] = Math.random();
+            }
+
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('aCharIndex', new THREE.BufferAttribute(charIndices, 1));
+            geometry.setAttribute('aOffset', new THREE.BufferAttribute(offsets, 3));
+            return geometry;
+        }
+
+        function createMaterial(type, size, alpha) {
+            return new THREE.ShaderMaterial({
+                vertexShader,
+                fragmentShader,
+                uniforms: {
+                    uTime: uniforms.uTime,
+                    uTexture: uniforms.uTexture,
+                    uResolution: uniforms.uResolution,
+                    uRain: uniforms.uRain,
+                    uWind: uniforms.uWind,
+                    uSnow: uniforms.uSnow,
+                    uWeatherPhase: uniforms.uWeatherPhase,
+                    uGroundColor: uniforms.uGroundColor,
+                    uCropsColor: uniforms.uCropsColor,
+                    uSceneAlpha: uniforms.uSceneAlpha,
+                    uTreeAlpha: uniforms.uTreeAlpha,
+                    uType: { value: type },
+                    uSize: { value: size },
+                    uAlpha: { value: alpha }
+                },
+                transparent: true,
+                depthWrite: false
+            });
+        }
+
+        function addParticles(type, size, alpha, count, positionGenerator) {
+            const geometry = createParticleGeometry(count, positionGenerator);
+            return new THREE.Points(geometry, createMaterial(type, size, alpha));
+        }
+
+        // ========================================
+        // オブジェクト生成
+        // ========================================
+
+        function createGround() {
+            groundParticles = addParticles(PARTICLE_TYPE.GROUND, 35.0, 1.0, 15000, () => {
+                const r = Math.pow(Math.random(), 0.8) * 35;
+                const theta = Math.random() * Math.PI * 2;
+                return [
+                    r * Math.cos(theta),
+                    -2.5 + (Math.random() - 0.5) * 0.5,
+                    r * Math.sin(theta)
+                ];
+            });
+            scene.add(groundParticles);
+        }
+
+        function createField() {
+            const rowCount = 16, cropsPerRow = 600;
+            const totalCount = rowCount * cropsPerRow;
+
+            fieldParticles = addParticles(PARTICLE_TYPE.FIELD, 30.0, 1.0, totalCount, (i) => {
+                const row = Math.floor(i / cropsPerRow);
+                const rowZ = (row - rowCount / 2) * 2.0;
+                const cropX = (Math.random() - 0.5) * 45;
+                const spread = Math.random() * 0.8;
+                const theta = Math.random() * Math.PI * 2;
+                return [
+                    cropX + spread * Math.cos(theta),
+                    -2.5 + Math.pow(Math.random(), 1.5) * 1.5,
+                    rowZ + spread * Math.sin(theta) + (Math.random() - 0.5) * 0.5
+                ];
+            });
+            scene.add(fieldParticles);
+        }
+
+        function createWeather() {
+            weatherParticles = addParticles(PARTICLE_TYPE.WEATHER, 40.0, 1.0, 3500, () => {
+                return [
+                    (Math.random() - 0.5) * 60,
+                    (Math.random() - 0.5) * 20 + 4,
+                    (Math.random() - 0.5) * 40
+                ];
+            });
+            scene.add(weatherParticles);
+        }
+
+        function createGiantTree() {
+            const totalCount = 25000;
+            const trunkCount = 8000;
+
+            const canopyClusters = [
+                { cx: 0, cy: 12.0, cz: 0, radius: 8.0 },
+                { cx: 4.0, cy: 9.0, cz: 3.0, radius: 6.0 },
+                { cx: -3.0, cy: 10.0, cz: -4.0, radius: 7.0 }
+            ];
+
+            giantTreeParticles = addParticles(PARTICLE_TYPE.GIANT_TREE, 20.0, 1.0, totalCount, (i) => {
+                if (i < trunkCount) {
+                    const y = Math.random() * 15.0 - 2.5;
+                    const radius = (1.0 - (y + 2.5) / 15.0) * 3.0 + 1.0;
+                    const theta = Math.random() * Math.PI * 2;
+                    const r = Math.pow(Math.random(), 0.5) * radius;
+                    return [r * Math.cos(theta), y, r * Math.sin(theta)];
+                }
+
+                const cluster = canopyClusters[Math.floor(Math.random() * canopyClusters.length)];
+                const r = Math.pow(Math.random(), 0.5) * cluster.radius;
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+                return [
+                    cluster.cx + r * Math.sin(phi) * Math.cos(theta),
+                    cluster.cy + r * Math.sin(phi) * Math.sin(theta) * 0.7,
+                    cluster.cz + r * Math.cos(phi)
+                ];
+            });
+            scene.add(giantTreeParticles);
+        }
+
+        function createMainText() {
+            const geometry = createParticleGeometry(MAX_TEXT_LENGTH, (i) => {
+                return [0, 1.0, -6.0];
+            });
+            const offsets = geometry.attributes.aOffset.array;
+            for (let i = 0; i < MAX_TEXT_LENGTH; i++) {
+                offsets[i * 3] = i * 0.6;
+                offsets[i * 3 + 1] = 0;
+                offsets[i * 3 + 2] = 0;
+            }
+            geometry.attributes.aOffset.needsUpdate = true;
+
+            mainTextParticles = new THREE.Points(geometry, createMaterial(PARTICLE_TYPE.MAIN_TEXT, 15.0, 1.0));
+            camera.add(mainTextParticles);
+            scene.add(camera);
+        }
+
+        // ========================================
+        // テクスチャ・文字更新
+        // ========================================
+
+        function createTextTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, 512, 256);
+
+            ctx.fillStyle = '#ffffff';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.font = 'bold 48px serif';
+
+            for (let i = 0; i < 32; i++) {
+                const col = i % 8;
+                const row = Math.floor(i / 8);
+                ctx.fillText(CHARS_LIST[i], col * 64 + 32, row * 64 + 32);
+            }
+
+            return new THREE.CanvasTexture(canvas);
+        }
+
+        function updateMainText(phaseIndex) {
+            const text = phases[phaseIndex].text;
+            const charIndices = mainTextParticles.geometry.attributes.aCharIndex.array;
+
+            for (let i = 0; i < MAX_TEXT_LENGTH; i++) {
+                charIndices[i] = (i < text.length) ? CHARS_LIST.indexOf(text[i]) : SPACE_CHAR_INDEX;
+            }
+            mainTextParticles.geometry.attributes.aCharIndex.needsUpdate = true;
+        }
+
+        function updateBackgroundChars(phaseIndex) {
+            const text = phases[phaseIndex].text;
+            const availableIndices = [];
+
+            for (let i = 0; i < text.length; i++) {
+                const idx = CHARS_LIST.indexOf(text[i]);
+                if (idx !== -1) availableIndices.push(idx);
+            }
+
+            [groundParticles, fieldParticles, weatherParticles, giantTreeParticles].forEach(mesh => {
+                if (!mesh) return;
+                const array = mesh.geometry.attributes.aCharIndex.array;
+                for (let i = 0; i < array.length; i++) {
+                    array[i] = availableIndices[Math.floor(Math.random() * availableIndices.length)];
+                }
+                mesh.geometry.attributes.aCharIndex.needsUpdate = true;
+            });
+        }
+
+        // ========================================
+        // イベントハンドラ
+        // ========================================
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            uniforms.uResolution.value.set(window.innerWidth, window.innerHeight);
+        }
+
+        function onMouseMove(event) {
+            mouseX = (event.clientX / window.innerWidth) * 2 - 1;
+            mouseY = -(event.clientY / window.innerHeight) * 2 + 1;
+        }
+
+        function onTouchMove(event) {
+            mouseX = (event.touches[0].clientX / window.innerWidth) * 2 - 1;
+            mouseY = -(event.touches[0].clientY / window.innerHeight) * 2 + 1;
+        }
+
+        // ========================================
+        // フェーズ遷移
+        // ========================================
+
+        function transitionToNextPhase() {
+            const ui = document.getElementById('ui-container');
+            ui.style.opacity = 0;
+            isMainTextFadingOut = true;
+
+            // 音声のクロスフェードはすぐ開始（視覚より先に音が混ざり始める）
+            const nextIndex = (currentPhaseIndex + 1) % phases.length;
+            startPhaseAudio(nextIndex);
+
+            setTimeout(() => {
+                currentPhaseIndex = nextIndex;
+                targetParams = phases[currentPhaseIndex];
+
+                document.getElementById('ui-title').innerText = targetParams.title;
+                document.getElementById('ui-desc').innerText = targetParams.desc;
+                ui.style.opacity = 1;
+
+                updateMainText(currentPhaseIndex);
+                updateBackgroundChars(currentPhaseIndex);
+                isMainTextFadingOut = false;
+            }, PHASE_TRANSITION_MS);
+        }
+
+        function interpolateParams(deltaTime) {
+            for (const key of INTERPOLATED_KEYS) {
+                currentParams[key] += (targetParams[key] - currentParams[key]) * deltaTime * LERP_SPEED;
+            }
+            for (const key of LERP_COLOR_KEYS) {
+                currentParams[key].lerp(targetParams[key], deltaTime * BG_LERP_SPEED);
+            }
+        }
+
+        function syncUniforms() {
+            uniforms.uRain.value = currentParams.rain;
+            uniforms.uWind.value = currentParams.wind;
+            uniforms.uSnow.value = currentParams.snow;
+            uniforms.uSceneAlpha.value = currentParams.sceneAlpha;
+            uniforms.uTreeAlpha.value = currentParams.treeAlpha;
+            uniforms.uGroundColor.value.copy(currentParams.groundColor);
+            uniforms.uCropsColor.value.copy(currentParams.cropsColor);
+
+            scene.fog.color.copy(currentParams.bgColor);
+            renderer.setClearColor(currentParams.bgColor);
+        }
+
+        // ========================================
+        // アニメーションループ
+        // ========================================
+
+        function animate(time) {
+            requestAnimationFrame(animate);
+
+            let deltaTime = (time - lastTime) * 0.001;
+            if (isNaN(deltaTime) || deltaTime > 0.1) deltaTime = 0.016;
+            lastTime = time;
+
+            const timeSec = time * 0.001;
+            uniforms.uTime.value = timeSec;
+
+            // フェーズ遷移
+            phaseTimer += deltaTime;
+            if (phaseTimer > PHASE_DURATION) {
+                phaseTimer = 0;
+                transitionToNextPhase();
+            }
+
+            // メインテキストのフェード
+            const textAlpha = mainTextParticles.material.uniforms.uAlpha;
+            const fadeDir = isMainTextFadingOut ? -1 : 1;
+            textAlpha.value = Math.max(0, Math.min(1.0, textAlpha.value + fadeDir * deltaTime * TEXT_FADE_SPEED));
+
+            // パラメータ補間とuniform同期
+            interpolateParams(deltaTime);
+            syncUniforms();
+
+            // 天候パーティクルの移動
+            const { rain, wind, snow } = currentParams;
+            weatherPhaseX += -(0.5 + wind * 20.0 + rain * 2.0 + snow * 5.0) * deltaTime;
+            weatherPhaseY += -(0.2 + rain * 15.0 - wind * 2.0 + snow * 3.0) * deltaTime;
+            uniforms.uWeatherPhase.value.set(weatherPhaseX, weatherPhaseY);
+
+            // カメラの軌道運動
+            const angle = timeSec * CAMERA_ORBIT_SPEED + mouseX * 0.5;
+            const targetX = CAMERA_ORBIT_RADIUS * Math.cos(angle);
+            const targetZ = CAMERA_ORBIT_RADIUS * Math.sin(angle);
+            const targetY = 3 - mouseY * 4;
+
+            camera.position.x += (targetX - camera.position.x) * CAMERA_EASE;
+            camera.position.z += (targetZ - camera.position.z) * CAMERA_EASE;
+            camera.position.y += (targetY - camera.position.y) * CAMERA_EASE;
+            camera.lookAt(0, 3, 0);
+
+            renderer.render(scene, camera);
+        }
+
+        // ========================================
+        // 初期化
+        // ========================================
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x02050a, FOG_DENSITY);
+
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.set(0, 4, 15);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            document.body.appendChild(renderer.domElement);
+
+            uniforms = {
+                uTime: { value: 0 },
+                uTexture: { value: createTextTexture() },
+                uResolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+                uRain: { value: 1.0 },
+                uWind: { value: 0.05 },
+                uSnow: { value: 0.0 },
+                uWeatherPhase: { value: new THREE.Vector2(0, 0) },
+                uGroundColor: { value: new THREE.Color(currentParams.groundColor) },
+                uCropsColor: { value: new THREE.Color(currentParams.cropsColor) },
+                uSceneAlpha: { value: 0.8 },
+                uTreeAlpha: { value: 0.0 }
+            };
+
+            createGround();
+            createField();
+            createWeather();
+            createGiantTree();
+            createMainText();
+
+            updateMainText(0);
+            updateBackgroundChars(0);
+
+            window.addEventListener('resize', onWindowResize);
+            document.addEventListener('mousemove', onMouseMove);
+            document.addEventListener('touchmove', onTouchMove, { passive: true });
+
+            setTimeout(() => {
+                document.getElementById('loading').style.opacity = '0';
+            }, 500);
+        }
+
+        // クリックで音声を初期化（ブラウザの自動再生ポリシー対応）
+        function onStartClick() {
+            const overlay = document.getElementById('audio-start');
+            if (!overlay) return;
+            overlay.style.opacity = '0';
+            overlay.style.pointerEvents = 'none';
+            setTimeout(() => overlay.remove(), 1000);
+            initAudio();
+        }
+        document.getElementById('audio-start').addEventListener('click', onStartClick);
+        document.getElementById('audio-start').addEventListener('touchend', onStartClick);
+
+        init();
+        requestAnimationFrame((t) => {
+            lastTime = t;
+            animate(t);
+        });
+    </script>
+</body>
+</html>
